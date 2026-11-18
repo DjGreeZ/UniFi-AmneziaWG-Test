@@ -2,6 +2,7 @@
 """Bounded read-only AWG diagnostics. No VPN configs, keys or packet payloads."""
 import concurrent.futures
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -18,6 +20,10 @@ AWG = str(ROOT / 'bin/awg')
 NS = ['ip', 'netns', 'exec', 'awgm']
 DEADLINE = 0
 LIMIT = 80000
+STATE_FIELDS = ('id', 'enabled', 'bound', 'phase', 'healthy', 'active_exit', 'checked',
+                'last_handshake', 'ip', 'latency', 'received', 'sent', 'network_id',
+                'backup', 'auto_return', 'message')
+PROXY_VARIABLES = ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')
 
 
 def clean(value):
@@ -72,6 +78,118 @@ def read_small(path):
             return clean(stream.read(4096)).replace('\x00', '')
     except OSError as exc:
         return clean(str(exc))
+
+
+def selected_scalars(value, fields):
+    if not isinstance(value, dict):
+        return {}
+    return {key: clean(value[key])[:1000] if isinstance(value[key], str) else value[key]
+            for key in fields if key in value
+            and (value[key] is None or isinstance(value[key], (str, bool, int, float)))}
+
+
+class NativeSocket(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect('/run/awg-native/api.sock')
+
+
+def service_state():
+    remaining = DEADLINE - time.monotonic() if DEADLINE else 3
+    if remaining <= 0:
+        return {'error': 'diagnostic time limit reached'}
+    client = NativeSocket('localhost', timeout=min(3, remaining))
+    try:
+        client.request('GET', '/state', headers={'X-UserId': 'awg-diagnostic', 'X-UserRole': 'owner'})
+        response = client.getresponse()
+        if response.status != 200:
+            return {'http_status': response.status}
+        value = json.loads(response.read(262145))
+        if not isinstance(value, dict) or not isinstance(value.get('connections'), list):
+            return {'error': 'unexpected service state format'}
+        return {'unix_time': int(time.time()),
+                **selected_scalars(value, ('version', 'limit', 'error')),
+                'connections': [selected_scalars(row, STATE_FIELDS)
+                                for row in value['connections'][:4]]}
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        # Never include an unparsed response or exception text containing it.
+        return {'error': 'service state unavailable', 'kind': type(exc).__name__}
+    finally:
+        client.close()
+
+
+def provisioning_metadata():
+    result = {}
+    for ident in ('1', '2', '3', '4'):
+        path = ROOT / 'connections' / ident / 'meta.json'
+        try:
+            with path.open('rb') as stream:
+                value = json.loads(stream.read(65537))
+            if not isinstance(value, dict):
+                raise ValueError('unexpected metadata format')
+            result[ident] = selected_scalars(value, ('pending_enabled', 'network_id', 'backup', 'auto_return'))
+            result[ident]['pending_enabled_present'] = 'pending_enabled' in value
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            result[ident] = {'error': 'metadata unavailable or invalid'}
+    return result
+
+
+def native_client_summary(text):
+    # UDAPI returns private keys. Keep only booleans and interface identifiers,
+    # including on parse failures. Do not emit the original response.
+    try:
+        rows = json.loads(text)
+        if not isinstance(rows, list):
+            raise ValueError('unexpected client format')
+        result = []
+        for index, row in enumerate(rows[:32], 1):
+            if not isinstance(row, dict):
+                continue
+            entry = {'index': index, 'enabled_type': type(row.get('enabled')).__name__}
+            enabled = row.get('enabled')
+            if enabled is None or isinstance(enabled, (bool, int)) or enabled in ('true', 'false', '0', '1'):
+                entry['enabled'] = enabled
+            for field in ('id', 'interface', 'interfaceName'):
+                v = row.get(field)
+                if isinstance(v, int) or isinstance(v, str) and re.fullmatch(r'(?:wgclt|wg)?[0-9]{1,6}', v):
+                    entry[field] = v
+            result.append(entry)
+        return json.dumps({'client_count': len(rows), 'clients': result})
+    except (ValueError, TypeError):
+        return json.dumps({'error': 'native VPN client response unavailable or invalid'})
+
+
+def provisioning_state():
+    native = run(['ubios-udapi-client', '-r', 'GET', '/vpn/wireguard/clients'],
+                 transform=native_client_summary)
+    # Do not retain UDAPI stderr either: it can contain raw API response data.
+    native['stderr'] = '(omitted)' if native.get('stderr') else ''
+    return {'service': service_state(), 'metadata': provisioning_metadata(), 'native_clients': native}
+
+
+def service_environment():
+    result = {}
+    for unit in ('awg-native.service', 'awg-native-panel.service'):
+        pid = run(['systemctl', 'show', unit, '-p', 'MainPID', '--value']).get('stdout', '').strip()
+        if not re.fullmatch(r'[1-9][0-9]*', pid):
+            result[unit] = {'error': 'no running service PID'}
+            continue
+        try:
+            with open('/proc/' + pid + '/environ', 'rb') as stream:
+                raw = stream.read(262145)
+            if len(raw) > 262144:
+                raise ValueError('environment too large')
+            names = [item.partition(b'=')[0].decode('ascii', 'ignore') for item in raw.split(b'\0')]
+            result[unit] = {'pid': int(pid), 'proxy_variable_names_only': sorted(
+                key for key in names if key.lower() in PROXY_VARIABLES),
+                'curl_home_set': 'CURL_HOME' in names,
+                'xdg_config_home_set': 'XDG_CONFIG_HOME' in names}
+        except (OSError, ValueError):
+            result[unit] = {'pid': int(pid), 'error': 'service environment unavailable'}
+    return result
 
 
 def strip_peers(text):
@@ -194,6 +312,7 @@ def matching(text):
 
 
 def collect(report):
+    report['provisioning_before'] = provisioning_state()
     checks = {
         'kernel': ['uname', '-srm'],
         'network_version': ['dpkg-query', '-W', '-f=${Package} ${Version}\n', 'unifi-native', 'unifi'],
@@ -230,9 +349,10 @@ def collect(report):
         report['interference_checks']['namespace_nftables'] = run(NS + ['nft', '-a', 'list', 'ruleset'])
     report['curl_overrides'] = {
         'proxy_variable_names_only': sorted(key for key in os.environ if key.lower() in
-            ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')),
+            PROXY_VARIABLES),
         'root_curlrc_exists': Path('/root/.curlrc').exists(),
         'root_config_curlrc_exists': Path('/root/.config/curlrc').exists(),
+        'service_environment': service_environment(),
     }
     report['component_hashes'] = {}
     for relative in ('service.py', 'config_parser.py', 'bin/amneziawg-go', 'bin/awg'):
@@ -250,6 +370,7 @@ def collect(report):
         report['connections'].append(connection(dev))
     if not interfaces:
         report['note'] = 'No active awgo1..awgo4 interface; enable the affected connection and rerun.'
+    report['provisioning_after'] = provisioning_state()
 
 
 def main():
@@ -262,7 +383,7 @@ def main():
     signal.signal(signal.SIGHUP, interrupted)
     os.umask(0o077)
     DEADLINE = time.monotonic() + 150
-    report = {'diagnostic_version': 1, 'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    report = {'diagnostic_version': 2, 'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'scope': 'Read-only system checks and bounded network probes; no VPN configuration files, '
                  'keys, passwords, environment values, journals or packet payloads collected. '
                  'The report contains IP addresses, routing and firewall information.'}
