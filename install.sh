@@ -89,14 +89,14 @@ ui_note() {
     printf '  %s\n' "$1" >&3
 }
 
-ui_init install 0.3.4-rc.1
+ui_init install 0.3.5
 BASE=https://raw.githubusercontent.com/DjGreeZ/UniFi-AmneziaWG-Test/main
-FILE=AmneziaWG-UniFi-v0.3.4-rc.1.run
+FILE=AmneziaWG-UniFi-v0.3.5.run
 AWG_UI_TEMP=$(mktemp -d /tmp/awg-download.XXXXXX)
 cd "$AWG_UI_TEMP"
 download_package() {
  curl -fsSL --connect-timeout 15 --max-time 300 "$BASE/$FILE" -o "$FILE"
- curl -fsSL --connect-timeout 15 --max-time 60 "$BASE/AmneziaWG-UniFi-v0.3.4-rc.1.sha256" -o checksums
+ curl -fsSL --connect-timeout 15 --max-time 60 "$BASE/AmneziaWG-UniFi-v0.3.5.sha256" -o checksums
  sha256sum -c checksums
 }
 ui_run 'Загрузка пакета' download_package
